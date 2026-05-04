@@ -8,10 +8,12 @@ from OpenGL.GL import *
 import numpy as np
 
 # GPU layout must match the GLSL std430 packing of:
-#   struct Material { vec3 emissive; vec3 albedo; uint reflects; };
+#   struct Material {
+#       vec3 emissive; vec3 albedo; uint reflects;
+#       float roughness; float metallic;
+#   };
 #   struct Triangle { vec3 v0; vec3 v1; vec3 v2; Material material; };
-# In std430 the trailing uint packs into albedo's vec3 alignment slot, so
-# the stride is 80 bytes — not 96 — and `reflects` lives at byte 76.
+# Material occupies 48 bytes (vec3-alignment rounding), Triangle is 96 bytes.
 triangle_dtype = np.dtype([
     ("v0",       np.float32, 3),
     ("_pad0",    np.float32),
@@ -27,23 +29,37 @@ triangle_dtype = np.dtype([
 
     ("albedo",   np.float32, 3),
     ("reflects", np.uint32),
+
+    ("roughness", np.float32),
+    ("metallic",  np.float32),
+    ("_pad4",     np.float32, 2),  # round Material to 48B (vec3-aligned)
 ])
-assert triangle_dtype.itemsize == 80
+assert triangle_dtype.itemsize == 96
 
 
-def _parse_mtl(path: Path) -> dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]]:
-    """Parse a Wavefront .mtl file. Returns name -> (emissive, albedo)."""
-    materials: dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]] = {}
+MaterialTuple = tuple[
+    tuple[float, float, float],  # emissive (Ke)
+    tuple[float, float, float],  # albedo   (Kd)
+    float,                       # roughness (Pr)
+    float,                       # metallic  (Pm)
+]
+
+
+def _parse_mtl(path: Path) -> dict[str, MaterialTuple]:
+    """Parse a Wavefront .mtl file. Returns name -> (emissive, albedo, roughness, metallic)."""
+    materials: dict[str, MaterialTuple] = {}
     if not path.exists():
         return materials
 
     name: str | None = None
     kd = (1.0, 1.0, 1.0)
     ke = (0.0, 0.0, 0.0)
+    pr = 1.0   # default fully rough
+    pm = 0.0   # default dielectric
 
     def flush() -> None:
         if name is not None:
-            materials[name] = (ke, kd)
+            materials[name] = (ke, kd, pr, pm)
 
     with open(path) as f:
         for raw in f:
@@ -56,10 +72,16 @@ def _parse_mtl(path: Path) -> dict[str, tuple[tuple[float, float, float], tuple[
                 name = parts[1]
                 kd = (1.0, 1.0, 1.0)
                 ke = (0.0, 0.0, 0.0)
+                pr = 1.0
+                pm = 0.0
             elif tag == "Kd" and len(parts) >= 4:
                 kd = (float(parts[1]), float(parts[2]), float(parts[3]))
             elif tag == "Ke" and len(parts) >= 4:
                 ke = (float(parts[1]), float(parts[2]), float(parts[3]))
+            elif tag == "Pr" and len(parts) >= 2:
+                pr = float(parts[1])
+            elif tag == "Pm" and len(parts) >= 2:
+                pm = float(parts[1])
     flush()
     return materials
 
@@ -70,7 +92,7 @@ def load_triangles_from_obj(path: str) -> np.ndarray:
     obj_dir = obj_path.parent
 
     vertices: list[tuple[float, float, float]] = []
-    materials: dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]] = {}
+    materials: dict[str, MaterialTuple] = {}
     faces: list[tuple[int, int, int, str | None]] = []
     current_mat: str | None = None
 
@@ -99,15 +121,19 @@ def load_triangles_from_obj(path: str) -> np.ndarray:
     verts = np.asarray(vertices, dtype=np.float32)
     out = np.zeros(len(faces), dtype=triangle_dtype)
 
-    default_mat = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    default_mat: MaterialTuple = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 1.0, 0.0)
     for i, (a, b, c, mat_name) in enumerate(faces):
-        emissive, albedo = materials.get(mat_name, default_mat) if mat_name else default_mat
+        emissive, albedo, roughness, metallic = (
+            materials.get(mat_name, default_mat) if mat_name else default_mat
+        )
         out[i]["v0"] = verts[a]
         out[i]["v1"] = verts[b]
         out[i]["v2"] = verts[c]
         out[i]["emissive"] = emissive
         out[i]["albedo"] = albedo
         out[i]["reflects"] = 1 if any(ch != 0.0 for ch in albedo) else 0
+        out[i]["roughness"] = roughness
+        out[i]["metallic"] = metallic
 
     return np.ascontiguousarray(out)
 
@@ -198,6 +224,7 @@ def setup_scene(obj_path: str):
         "iResolution":  glGetUniformLocation(program, "iResolution"),
         "numTriangles": glGetUniformLocation(program, "numTriangles"),
         "iSamples":     glGetUniformLocation(program, "iSamples"),
+        "iBackground":  glGetUniformLocation(program, "iBackground"),
     }
     return program, len(triangles), locs
 
@@ -206,7 +233,13 @@ def setup_scene(obj_path: str):
 # Live preview
 # ============================================================
 
-def run_preview(obj_path: str, samples: int, width: int, height: int) -> None:
+def run_preview(
+    obj_path: str,
+    samples: int,
+    width: int,
+    height: int,
+    background: tuple[float, float, float],
+) -> None:
     window = init_glfw_window(width, height, visible=True)
     glfw.set_framebuffer_size_callback(window, framebuffer_size_callback)
 
@@ -222,6 +255,7 @@ def run_preview(obj_path: str, samples: int, width: int, height: int) -> None:
         glUniform2f(locs["iResolution"], float(w), float(h))
         glUniform1i(locs["numTriangles"], num_tris)
         glUniform1i(locs["iSamples"], samples)
+        glUniform3f(locs["iBackground"], *background)
 
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
         glfw.swap_buffers(window)
@@ -243,6 +277,7 @@ def run_render(
     duration: float,
     samples: int,
     tile: int,
+    background: tuple[float, float, float],
 ) -> None:
     """Render frames to an offscreen FBO in tiles (sidesteps GPU watchdog) and pipe to ffmpeg."""
     window = init_glfw_window(width, height, visible=False)
@@ -281,6 +316,7 @@ def run_render(
     glUniform2f(locs["iResolution"], float(width), float(height))
     glUniform1i(locs["numTriangles"], num_tris)
     glUniform1i(locs["iSamples"], samples)
+    glUniform3f(locs["iBackground"], *background)
 
     try:
         for f in range(n_frames):
@@ -298,7 +334,6 @@ def run_render(
             glReadBuffer(GL_COLOR_ATTACHMENT0)
             glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, frame_buf)
             proc.stdin.write(frame_buf.tobytes())
-            print(f"frame {f + 1}/{n_frames}", flush=True)
     finally:
         if proc.stdin:
             proc.stdin.close()
@@ -320,13 +355,18 @@ def main():
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--duration", type=float, default=5.0, help="seconds (render mode)")
     p.add_argument("--tile", type=int, default=128, help="tile size for offline render (smaller = safer for watchdog)")
+    p.add_argument("--background", type=float, nargs=3, metavar=("R", "G", "B"),
+                   default=[0.5, 0.7, 1.0],
+                   help="sky/background color in linear RGB (default: 0.5 0.7 1.0)")
     args = p.parse_args()
+
+    background = (args.background[0], args.background[1], args.background[2])
 
     if args.render:
         run_render(args.obj, args.render, args.width, args.height,
-                   args.fps, args.duration, args.samples, args.tile)
+                   args.fps, args.duration, args.samples, args.tile, background)
     else:
-        run_preview(args.obj, args.samples, args.width, args.height)
+        run_preview(args.obj, args.samples, args.width, args.height, background)
 
 
 if __name__ == "__main__":
