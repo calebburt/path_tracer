@@ -145,56 +145,21 @@ vec3 randomUnitHemisphere(vec3 normal) {
          + normal * cosTheta;
 }
 
-// Trowbridge-Reitz GGX importance sample — returns a microfacet half-vector
-// distributed by D(h). Roughness=0 collapses to H = N (perfect mirror).
-vec3 sampleGGXHalf(vec3 normal, float roughness) {
-    float r1 = rand();
-    float r2 = rand();
-    float a = roughness * roughness;
-    float phi = 6.28318530718 * r1;
-    float cosTheta = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
-    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
-
-    vec3 H_local = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
-
-    vec3 up = abs(normal.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 tangent = normalize(cross(up, normal));
-    vec3 bitangent = cross(normal, tangent);
-    return tangent * H_local.x + bitangent * H_local.y + normal * H_local.z;
-}
-
-// Smith geometry (Schlick-GGX, direct-lighting variant)
-float smithG(float NdotV, float NdotL, float roughness) {
-    float r = roughness + 1.0;
-    float k = (r * r) / 8.0;
-    float gV = NdotV / (NdotV * (1.0 - k) + k);
-    float gL = NdotL / (NdotL * (1.0 - k) + k);
-    return gV * gL;
-}
-
-// Cook-Torrance PBR bounce: probabilistically pick specular GGX or Lambert diffuse.
+// PBR bounce: probabilistically pick specular or diffuse.
 // `throughputMult` is the BRDF*cos/pdf factor to multiply into the running throughput.
 Ray pbrBounce(vec3 V, vec3 N, vec3 hitPos, Material mat, out vec3 throughputMult) {
     vec3 F0 = mix(vec3(0.04), mat.albedo, mat.metallic);
-    float specProb = clamp(0.5 + 0.5 * mat.metallic, 0.25, 0.9);
+    float specProb = 0.05 + 0.95 * mat.metallic;
     vec3 origin = hitPos + N * 1e-4;
 
     if (rand() < specProb) {
-        vec3 H = sampleGGXHalf(N, mat.roughness);
-        vec3 L = reflect(-V, H);
-        if (dot(L, N) <= 0.0) {
-            throughputMult = vec3(0.0);
-            return Ray(origin, L);
-        }
-        float NdotV = max(dot(N, V), 1e-4);
-        float NdotL = max(dot(N, L), 1e-4);
-        float NdotH = max(dot(N, H), 1e-4);
-        float VdotH = max(dot(V, H), 1e-4);
-
-        vec3 F = F0 + (1.0 - F0) * pow(max(0.0, 1.0 - VdotH), 5.0);
-        float G = smithG(NdotV, NdotL, mat.roughness);
-        // BRDF * NdotL / pdf (GGX importance-sampled half-vector) = F * G * VdotH / (NdotH * NdotV)
-        throughputMult = F * G * VdotH / (NdotH * NdotV * specProb);
+        vec3 L = reflect(-V, N);
+        vec3 randomDir = randomUnitHemisphere(N);
+        L = mix(L, randomDir, mat.roughness); // roughness = 0 is perfect mirror, 1 is fully random
+        L = normalize(L);
+        
+        // Fade between white and albedo based on metallic
+        throughputMult = mix(vec3(1.0), mat.albedo, mat.metallic);
         return Ray(origin, L);
     } else {
         vec3 L = randomUnitHemisphere(N);  // cosine-weighted Lambert
