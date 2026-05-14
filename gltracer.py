@@ -133,7 +133,6 @@ def load_triangles_from_obj(path: str) -> np.ndarray:
         out[i]["albedo"] = albedo
         out[i]["reflects"] = 1 if any(ch != 0.0 for ch in albedo) else 0
         out[i]["roughness"] = roughness
-        print(f"Loaded triangle {i}: mat={mat_name} emissive={emissive} albedo={albedo} roughness={roughness} metallic={metallic}")
         out[i]["metallic"] = metallic
 
     return np.ascontiguousarray(out)
