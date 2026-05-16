@@ -145,23 +145,33 @@ vec3 randomUnitHemisphere(vec3 normal) {
          + normal * cosTheta;
 }
 
-// PBR bounce: probabilistically pick specular or diffuse.
-// `throughputMult` is the BRDF*cos/pdf factor to multiply into the running throughput.
+// PBR bounce: probabilistically pick specular or diffuse using Fresnel weighting.
+// `throughputMult` is the color to multiply into the running throughput.
 Ray pbrBounce(vec3 V, vec3 N, vec3 hitPos, Material mat, out vec3 throughputMult) {
     vec3 F0 = mix(vec3(0.04), mat.albedo, mat.metallic);
-    float specProb = 0.05 + 0.95 * mat.metallic;
     vec3 origin = hitPos + N * 1e-4;
 
+    // Fresnel-Schlick: F(θ) = F0 + (1 - F0)(1 - cos(θ))^5
+    float cosTheta = clamp(dot(V, N), 0.0, 1.0);
+    float f = pow(1.0 - cosTheta, 5.0);
+    vec3 fresnel = F0 + (vec3(1.0) - F0) * f;
+
+    // Use luminance of Fresnel as specular probability (0.04 for dielectrics at normal, 1.0 for metals)
+    float specProb = dot(fresnel, vec3(0.299, 0.587, 0.114));
+
     if (rand() < specProb) {
+        // Specular reflection
         vec3 L = reflect(-V, N);
         vec3 randomDir = randomUnitHemisphere(N);
         L = mix(L, randomDir, mat.roughness); // roughness = 0 is perfect mirror, 1 is fully random
         L = normalize(L);
-        
-        // Fade between white and albedo based on metallic
-        throughputMult = mix(vec3(1.0), mat.albedo, mat.metallic);
+
+        // Dielectrics reflect white, metals reflect their albedo, both modulated by Fresnel
+        vec3 specColor = mix(vec3(1.0), mat.albedo, mat.metallic);
+        throughputMult = fresnel * specColor / specProb;
         return Ray(origin, L);
     } else {
+        // Diffuse reflection (only non-metals scatter diffusely)
         vec3 L = randomUnitHemisphere(N);  // cosine-weighted Lambert
         vec3 kd = (1.0 - mat.metallic) * mat.albedo;
         throughputMult = kd / (1.0 - specProb);
@@ -190,8 +200,11 @@ void handleHit(inout vec3 col, Ray ray, HitResult hit) {
                                    currentHit.material, throughputMult);
         throughput *= throughputMult;
 
-        if (max(max(throughput.x, throughput.y), throughput.z) <= 0.0)
+        // Russian roulette: probabilistically terminate low-throughput paths
+        float survivalProb = min(1.0, dot(throughput, vec3(0.299, 0.587, 0.114))); // Match how perceptible to humans the color is
+        if (rand() > survivalProb)
             break;
+        throughput /= survivalProb;
 
         HitResult nextHit = raySceneIntersection(bouncedRay);
         if (!nextHit.hit) {
