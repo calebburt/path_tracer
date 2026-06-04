@@ -221,6 +221,7 @@ def setup_scene(obj_path: str):
 
     locs = {
         "iTime":        glGetUniformLocation(program, "iTime"),
+        "iApertureSize":glGetUniformLocation(program, "iApertureSize"),
         "iResolution":  glGetUniformLocation(program, "iResolution"),
         "numTriangles": glGetUniformLocation(program, "numTriangles"),
         "iSamples":     glGetUniformLocation(program, "iSamples"),
@@ -235,6 +236,7 @@ def setup_scene(obj_path: str):
 
 def run_preview(
     obj_path: str,
+    aperture_size: float,
     samples: int,
     width: int,
     height: int,
@@ -253,6 +255,7 @@ def run_preview(
         w, h = glfw.get_framebuffer_size(window)
         glUniform1f(locs["iTime"], glfw.get_time() - start)
         glUniform2f(locs["iResolution"], float(w), float(h))
+        glUniform1f(locs["iApertureSize"], aperture_size)
         glUniform1i(locs["numTriangles"], num_tris)
         glUniform1i(locs["iSamples"], samples)
         glUniform3f(locs["iBackground"], *background)
@@ -270,6 +273,7 @@ def run_preview(
 
 def run_render(
     obj_path: str,
+    aperture_size: float,
     out_path: str,
     width: int,
     height: int,
@@ -314,6 +318,7 @@ def run_render(
 
     glUseProgram(program)
     glUniform2f(locs["iResolution"], float(width), float(height))
+    glUniform1f(locs["iApertureSize"], aperture_size)
     glUniform1i(locs["numTriangles"], num_tris)
     glUniform1i(locs["iSamples"], samples)
     glUniform3f(locs["iBackground"], *background)
@@ -348,6 +353,7 @@ def run_render(
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--obj", default="cornell_box.obj")
+    p.add_argument("--aperture", type=float, default=1)
     p.add_argument("--samples", type=int, default=10)
     p.add_argument("--width", type=int, default=800)
     p.add_argument("--height", type=int, default=600)
@@ -363,10 +369,10 @@ def main():
     background = (args.background[0], args.background[1], args.background[2])
 
     if args.render:
-        run_render(args.obj, args.render, args.width, args.height,
+        run_render(args.obj, args.aperture, args.render, args.width, args.height,
                    args.fps, args.duration, args.samples, args.tile, background)
     else:
-        run_preview(args.obj, args.samples, args.width, args.height, background)
+        run_preview(args.obj, args.aperture, args.samples, args.width, args.height, background)
 
 
 if __name__ == "__main__":

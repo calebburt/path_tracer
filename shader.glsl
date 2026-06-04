@@ -5,6 +5,10 @@ out vec4 FragColor;
 
 uniform float iTime;
 uniform vec2 iResolution;
+uniform float iApertureSize;
+uniform int numTriangles;
+uniform int iSamples;
+uniform vec3 iBackground;
 
 struct Ray {
     vec3 origin;
@@ -37,23 +41,10 @@ struct Triangle {
 layout(std430, binding = 0) buffer Triangles {
     Triangle tris[];
 };
-uniform int numTriangles;
-uniform int iSamples;
-uniform vec3 iBackground;
 
 // Hash function to generate pseudo-random value from a seed
 float hash(float seed) {
     return fract(sin(seed) * 43758.5453123);
-}
-
-// 2D hash function
-float hash2D(vec2 p) {
-    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
-}
-
-// 3D hash function for (x, y, time)
-float hash3D(vec3 p) {
-    return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123);
 }
 
 // PCG hash — integer-based, no sin precision issues
@@ -191,9 +182,6 @@ void handleHit(inout vec3 col, Ray ray, HitResult hit) {
     for (int i = 0; i < MAX_BOUNCES; i++) {
         emissive += throughput * currentHit.material.emissive;
 
-        if (currentHit.material.reflects == 0u)
-            break;
-
         vec3 V = -currentRay.direction;
         vec3 throughputMult;
         Ray bouncedRay = pbrBounce(V, currentHit.normal, currentHit.position,
@@ -237,14 +225,27 @@ void main() {
     float fov = radians(45.0);
     float z = 1.0 / tan(fov * 0.5);
 
+    // Length where the ray hits the focal plane, controls depth of field strength.
+    // This does NOT control the field of view — FOV is handled by 'z'.
+    // focalLength is the distance from the camera where rays should converge to create a sharp image.
+    float focalLength = distance(camPos, camTarget);
+
     vec2 pixelSize = vec2(2.0 / iResolution.y);
 
     vec3 accumColor = vec3(0.0);
     for (int i = 0; i < SAMPLES; i++) {
         vec2 jitter = (vec2(rand(), rand()) - 0.5) * pixelSize;
+        vec2 aperturePoint = (vec2(rand(), rand()) - 0.5) * iApertureSize;
+        vec3 camPosJittered = camPos + camRight * aperturePoint.x + camUp * aperturePoint.y;
         vec2 sampleUv = uv + jitter;
+        // Primary ray direction based on pinhole projection (controls FOV)
         vec3 rayDir = normalize(sampleUv.x * camRight + sampleUv.y * camUp + z * camDir);
-        Ray ray = Ray(camPos, rayDir);
+        // If using depth of field, shift origin across the aperture and reaim the ray so that
+        // it passes through the focal plane at distance 'focalLength' from the original camera position.
+        // This makes focalLength determine the plane of perfect focus without altering FOV.
+        vec3 focalPoint = camPos + rayDir * focalLength;
+        rayDir = normalize(focalPoint - camPosJittered);
+        Ray ray = Ray(camPosJittered, rayDir);
 
         HitResult result = raySceneIntersection(ray);
 
