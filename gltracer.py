@@ -6,6 +6,7 @@ from pathlib import Path
 import glfw
 from OpenGL.GL import *
 import numpy as np
+from PIL import Image
 
 # GPU layout must match the GLSL std430 packing of:
 #   struct Material {
@@ -346,6 +347,63 @@ def run_render(
         glfw.terminate()
 
 
+def run_photo(
+    obj_path: str,
+    aperture_size: float,
+    out_path: str,
+    width: int,
+    height: int,
+    time: float,
+    samples: int,
+    tile: int,
+    background: tuple[float, float, float],
+) -> None:
+    """Render a single frame at given time and save to an image file."""
+    window = init_glfw_window(width, height, visible=False)
+    program, num_tris, locs = setup_scene(obj_path)
+
+    # Offscreen color target
+    fbo = glGenFramebuffers(1)
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+    color_tex = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, color_tex)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color_tex, 0)
+    if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+        raise RuntimeError("FBO incomplete")
+
+    glPixelStorei(GL_PACK_ALIGNMENT, 1)
+
+    frame_buf = np.empty((height, width, 3), dtype=np.uint8)
+
+    glUseProgram(program)
+    glUniform2f(locs["iResolution"], float(width), float(height))
+    glUniform1f(locs["iApertureSize"], aperture_size)
+    glUniform1i(locs["numTriangles"], num_tris)
+    glUniform1i(locs["iSamples"], samples)
+    glUniform3f(locs["iBackground"], *background)
+
+    try:
+        glUniform1f(locs["iTime"], time)
+        for ty in range(0, height, tile):
+            for tx in range(0, width, tile):
+                tw = min(tile, width - tx)
+                th = min(tile, height - ty)
+                glViewport(tx, ty, tw, th)
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+                glFinish()
+
+        glReadBuffer(GL_COLOR_ATTACHMENT0)
+        glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, frame_buf)
+        # OpenGL is bottom-up; flip to top-down for image files
+        img = np.flipud(frame_buf)
+        Image.fromarray(img, mode="RGB").save(out_path)
+    finally:
+        glfw.terminate()
+
+
 # ============================================================
 # Entry point
 # ============================================================
@@ -358,8 +416,10 @@ def main():
     p.add_argument("--width", type=int, default=800)
     p.add_argument("--height", type=int, default=600)
     p.add_argument("--render", metavar="OUT.mp4", help="render to a video file instead of showing a window")
+    p.add_argument("--photo", metavar="OUT.png", help="render a single frame and save to an image file")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--duration", type=float, default=5.0, help="seconds (render mode)")
+    p.add_argument("--time", type=float, default=0.0, help="time value for photo mode")
     p.add_argument("--tile", type=int, default=128, help="tile size for offline render (smaller = safer for watchdog)")
     p.add_argument("--background", type=float, nargs=3, metavar=("R", "G", "B"),
                    default=[0.5, 0.7, 1.0],
@@ -368,7 +428,10 @@ def main():
 
     background = (args.background[0], args.background[1], args.background[2])
 
-    if args.render:
+    if args.photo:
+        run_photo(args.obj, args.aperture, args.photo, args.width, args.height,
+                  args.time, args.samples, args.tile, background)
+    elif args.render:
         run_render(args.obj, args.aperture, args.render, args.width, args.height,
                    args.fps, args.duration, args.samples, args.tile, background)
     else:
