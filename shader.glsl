@@ -101,6 +101,14 @@ HitResult raySceneIntersection(Ray ray) {
         Material(vec3(0.0), vec3(0.0), 0u, 1.0, 0.0)
     );
 
+    float fogT; // Fog can be anywhere, randomly choose a point normal-distributed, centered on 0 and with a standard deviation of 5 units, so that most fog hits are within ~10 units but some can be farther.
+    {
+        float u1 = rand();
+        float u2 = rand();
+        float z = sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2); // Box-Muller transform
+        fogT = abs(z * 10.0); // Scale by standard deviation and take absolute value to get a positive distance
+    }
+
     for (int i = 0; i < numTriangles; i++) {
         Triangle tri = tris[i];
 
@@ -113,6 +121,16 @@ HitResult raySceneIntersection(Ray ray) {
         if (hit.hit && hit.t < closestHit.t) {
             closestHit = hit;
         }
+    }
+
+    if (fogT < closestHit.t) {
+        closestHit = HitResult(
+            true,
+            fogT,
+            ray.origin + ray.direction * fogT,
+            vec3(rand(), rand(), rand()),
+            Material(vec3(0), vec3(1), 0u, 1.0, 0.0)
+        );
     }
 
     return closestHit;

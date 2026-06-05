@@ -394,6 +394,7 @@ def run_photo(
                 glViewport(tx, ty, tw, th)
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
                 glFinish()
+                print("Done tile", tx, ty)
 
         glReadBuffer(GL_COLOR_ATTACHMENT0)
         glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, frame_buf)
