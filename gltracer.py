@@ -31,16 +31,18 @@ triangle_dtype = np.dtype([
     ("albedo",   np.float32, 3),
     ("reflects", np.uint32),
 
+    ("alpha",     np.float32),
     ("roughness", np.float32),
     ("metallic",  np.float32),
-    ("_pad4",     np.float32, 2),  # round Material to 48B (vec3-aligned)
+    ("_pad4",     np.float32, 1),  # round Material to 48B (vec3-aligned)
 ])
 assert triangle_dtype.itemsize == 96
 
 
 MaterialTuple = tuple[
-    tuple[float, float, float],  # emissive (Ke)
-    tuple[float, float, float],  # albedo   (Kd)
+    tuple[float, float, float],  # emissive  (Ke)
+    tuple[float, float, float],  # albedo    (Kd)
+    float,                       # alpha     (d)
     float,                       # roughness (Pr)
     float,                       # metallic  (Pm)
 ]
@@ -55,12 +57,13 @@ def _parse_mtl(path: Path) -> dict[str, MaterialTuple]:
     name: str | None = None
     kd = (1.0, 1.0, 1.0)
     ke = (0.0, 0.0, 0.0)
+    d = 1.0
     pr = 1.0   # default fully rough
     pm = 0.0   # default dielectric
 
     def flush() -> None:
         if name is not None:
-            materials[name] = (ke, kd, pr, pm)
+            materials[name] = (ke, kd, d, pr, pm)
 
     with open(path) as f:
         for raw in f:
@@ -79,6 +82,8 @@ def _parse_mtl(path: Path) -> dict[str, MaterialTuple]:
                 kd = (float(parts[1]), float(parts[2]), float(parts[3]))
             elif tag == "Ke" and len(parts) >= 4:
                 ke = (float(parts[1]), float(parts[2]), float(parts[3]))
+            elif tag == "d" and len(parts) >= 2:
+                d = float(parts[1])
             elif tag == "Pr" and len(parts) >= 2:
                 pr = float(parts[1])
             elif tag == "Pm" and len(parts) >= 2:
@@ -122,9 +127,9 @@ def load_triangles_from_obj(path: str) -> np.ndarray:
     verts = np.asarray(vertices, dtype=np.float32)
     out = np.zeros(len(faces), dtype=triangle_dtype)
 
-    default_mat: MaterialTuple = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 1.0, 0.0)
+    default_mat: MaterialTuple = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 1.0, 1.0, 0.0)
     for i, (a, b, c, mat_name) in enumerate(faces):
-        emissive, albedo, roughness, metallic = (
+        emissive, albedo, alpha, roughness, metallic = (
             materials.get(mat_name, default_mat) if mat_name else default_mat
         )
         out[i]["v0"] = verts[a]
@@ -133,6 +138,7 @@ def load_triangles_from_obj(path: str) -> np.ndarray:
         out[i]["emissive"] = emissive
         out[i]["albedo"] = albedo
         out[i]["reflects"] = 1 if any(ch != 0.0 for ch in albedo) else 0
+        out[i]["alpha"] = alpha
         out[i]["roughness"] = roughness
         out[i]["metallic"] = metallic
 
