@@ -9,9 +9,6 @@ uniform float iApertureSize;
 uniform int numTriangles;
 uniform int iSamples;
 uniform vec3 iBackground;
-uniform float u_sigma_s; // scattering coefficient
-uniform float u_sigma_a; // absorption coefficient
-uniform float u_phase_g; // Henyey-Greenstein g parameter (-1..1)
 
 struct Ray {
     vec3 origin;
@@ -20,8 +17,9 @@ struct Ray {
 
 struct Material {
     vec3 emissive;
+    float ior;
     vec3 albedo;
-    uint reflects;
+    uint dielectric;
     float alpha;
     float roughness;
     float metallic;
@@ -29,6 +27,7 @@ struct Material {
 
 struct HitResult {
     bool hit;
+    bool frontFace;
     float t;
     vec3 position;
     vec3 normal;
@@ -54,8 +53,8 @@ struct RNG {
 RNG rng;
 
 uint pcg32(inout RNG rng) {
-    // Simplified 32-bit LCG-based RNG to avoid using umulExtended / 64-bit ops
-    // Use state.x as the 32-bit state. Update with LCG constants and a simple xorshift mix.
+    // Simplified 32-bit LCG-based RNG
+    // Use state.x as the 32-bit state.
     uint s = rng.state.x;
     s = s * 1664525u + 1013904223u; // LCG step
     // xorshift32 mix
@@ -71,8 +70,8 @@ float rand() {
     return float(pcg32(rng)) * (1.0 / 4294967296.0);
 }
 
-HitResult rayTriangleIntersection(Ray ray, vec3 v0, vec3 v1, vec3 v2, Material material, bool cullBackface) {
-    HitResult result = HitResult(false, -1.0, vec3(0.0), vec3(0.0), material);
+HitResult rayTriangleIntersection(Ray ray, vec3 v0, vec3 v1, vec3 v2, Material material) {
+    HitResult result = HitResult(false, true, -1.0, vec3(0.0), vec3(0.0), material);
 
     vec3 rayOrigin = ray.origin;
     vec3 rayDirection = ray.direction;
@@ -82,9 +81,9 @@ HitResult rayTriangleIntersection(Ray ray, vec3 v0, vec3 v1, vec3 v2, Material m
     vec3 edge2 = v2 - v0;
     vec3 h = cross(rayDirection, edge2);
     float a = dot(edge1, h);
-    // Backface culling: a > 0 for front-face hits, a <= 0 for back-face / parallel.
-    if (cullBackface && a < epsilon)
-        return result;
+    // Backface detection: a > 0 for front-face hits, a <= 0 for back-face / parallel.
+    if (a < epsilon)
+        result.frontFace = false;
     float f = 1.0 / a;
     vec3 s = rayOrigin - v0;
     float u = f * dot(s, h);
@@ -99,19 +98,20 @@ HitResult rayTriangleIntersection(Ray ray, vec3 v0, vec3 v1, vec3 v2, Material m
         vec3 normal = cross(edge1, edge2);
         if (length(normal) < epsilon)
             return result;
-        result = HitResult(true, t, rayOrigin + rayDirection * t, normalize(normal), material);
+        result = HitResult(true, result.frontFace, t, rayOrigin + rayDirection * t, normalize(normal), material);
         return result; // Intersection
     } else
         return result; // Line intersection but not a ray intersection
 }
 
-HitResult raySceneIntersection(Ray ray) {
+HitResult raySceneIntersection(Ray ray, bool cullBackface) {
     HitResult closestHit = HitResult(
         false,
+        true,
         1e30,
         vec3(0.0),
         vec3(0.0),
-        Material(vec3(0.0), vec3(0.0), 0u, 1.0, 1.0, 0.0)
+        Material(vec3(0.0), 1.0, vec3(0.0), 0u, 1.0, 1.0, 0.0)
     );
 
     for (int i = 0; i < numTriangles; i++) {
@@ -120,9 +120,11 @@ HitResult raySceneIntersection(Ray ray) {
         HitResult hit = rayTriangleIntersection(
             ray,
             tri.v0, tri.v1, tri.v2,
-            tri.material,
-            true
+            tri.material
         );
+
+        if (cullBackface && !hit.frontFace)
+            hit.hit = false;
 
         if (hit.hit && hit.t < closestHit.t) {
             closestHit = hit;
@@ -150,86 +152,100 @@ vec3 randomUnitHemisphere(vec3 normal) {
          + normal * cosTheta;
 }
 
-// Sample Henyey-Greenstein phase function around direction `wo`.
-vec3 samplePhaseHG(vec3 wo, float g) {
-    float u1 = rand();
-    float u2 = rand();
-    float cosTheta;
-    if (abs(g) < 1e-3) {
-        cosTheta = 1.0 - 2.0 * u1;
-    } else {
-        float sq = (1.0 - g * g) / (1.0 - g + 2.0 * g * u1);
-        cosTheta = (1.0 + g * g - sq * sq) / (2.0 * g);
+vec3 randomUnitSphere()
+{
+    while (true)
+    {
+        vec3 p = vec3(
+            rand() * 2.0 - 1.0,
+            rand() * 2.0 - 1.0,
+            rand() * 2.0 - 1.0
+        );
+
+        float len2 = dot(p, p);
+
+        if (len2 > 0.0 && len2 < 1.0)
+            return p * inversesqrt(len2);
     }
-    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
-    float phi = 6.28318530718 * u2;
-
-    vec3 up = abs(wo.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 tangent = normalize(cross(up, wo));
-    vec3 bitangent = cross(wo, tangent);
-
-    return tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + wo * cosTheta;
 }
 
 // PBR bounce: probabilistically pick specular or diffuse using Fresnel weighting.
 // `throughputMult` is the color to multiply into the running throughput.
-Ray pbrBounce(vec3 V, vec3 N, vec3 hitPos, Material mat, out vec3 throughputMult) {
-    float epsilon = 0.0001;
+Ray pbrBounce(vec3 V, vec3 N, HitResult hit, Material mat, out vec3 throughputMult) {
+    const float EPS=1e-4;
+    vec3 origin=hit.position+N*EPS;
 
-    // If the material lets the ray pass through, return a continued ray in
-    // the incoming direction without recursing. Otherwise fall through to
-    // the standard PBR scattering logic below.
-    if (mat.alpha < 1.0 - epsilon) {
-        if (rand() > mat.alpha) {
-            // Pass through: continue along the incoming ray direction (-V)
-            throughputMult = vec3(1.0);
-            vec3 contDir = normalize(-V);
-            vec3 origin = hitPos + contDir * 1e-4;
-            return Ray(origin, contDir);
+    if(bool(mat.dielectric)) {
+        float eta=mat.ior;
+        float etaRatio=hit.frontFace?(1.0/eta):eta;
+
+        float cosTheta=min(dot(-V,N),1.0);
+        float sinTheta=sqrt(max(0.0,1.0-cosTheta*cosTheta));
+
+        float r0=(eta-1.0)/(eta+1.0);
+        r0*=r0;
+
+        float fresnel=r0+(1.0-r0)*pow(1.0-cosTheta,5.0);
+        bool tir=etaRatio*sinTheta>1.0;
+
+        vec3 dir;
+
+        if(tir||rand()>fresnel) {
+            dir=reflect(-V,N);
+
+            if(mat.roughness>0.0)
+                dir=normalize(dir+randomUnitSphere()*mat.roughness);
+
+            throughputMult=vec3(1.0);
         } else {
-            // Isotropic scattering: random direction in a sphere
-            vec3 randomDir = normalize(vec3(rand() * 2.0 - 1.0, rand() * 2.0 - 1.0, rand() * 2.0 - 1.0));
-            vec3 origin = hitPos;
-            throughputMult = mat.albedo; // Modulate by albedo for colored transparency
-            return Ray(origin, randomDir);
+            dir=refract(-V,N,etaRatio);
+
+            if (mat.roughness>0.0)
+                dir=normalize(dir+randomUnitSphere()*mat.roughness);
+
+            throughputMult=mat.albedo;
         }
+
+        return Ray(hit.position+dir*EPS,dir);
     }
 
-    vec3 F0 = mix(vec3(0.04), mat.albedo, mat.metallic);
-    vec3 origin = hitPos + N * 1e-4;
+    vec3 F0=mix(vec3(0.04), mat.albedo,mat.metallic);
 
-    // Fresnel-Schlick: F(θ) = F0 + (1 - F0)(1 - cos(θ))^5
-    float cosTheta = clamp(dot(V, N), 0.0, 1.0);
-    float f = pow(1.0 - cosTheta, 5.0);
-    vec3 fresnel = F0 + (vec3(1.0) - F0) * f;
+    float NdotV=max(dot(N, V), 0.0);
 
-    // Use luminance of Fresnel as specular probability (0.04 for dielectrics at normal, 1.0 for metals)
-    float specProb = dot(fresnel, vec3(0.299, 0.587, 0.114));
-    float denomSpec = max(specProb, epsilon);
-    float denomDiff = max(1.0 - specProb, epsilon);
+    vec3 fresnel=F0+(vec3(1.0)-F0) * pow(1.0-NdotV,5.0);
 
-    if (rand() < specProb) {
-        // Specular reflection
-        vec3 L = reflect(-V, N);
-        vec3 randomDir = randomUnitHemisphere(N);
-        L = mix(L, randomDir, mat.roughness); // roughness = 0 is perfect mirror, 1 is fully random
-        L = normalize(L);
+    float specProb=clamp(
+        dot(fresnel,vec3(0.2126,0.7152,0.0722)),
+        0.05,
+        0.95
+    );
 
-        // Dielectrics reflect white, metals reflect their albedo, both modulated by Fresnel
-        vec3 specColor = mix(vec3(1.0), mat.albedo, mat.metallic);
-        throughputMult = fresnel * specColor / denomSpec;
-        return Ray(origin, L);
-    } else {
-        // Diffuse reflection (only non-metals scatter diffusely)
-        vec3 L = randomUnitHemisphere(N);  // cosine-weighted Lambert
-        vec3 kd = (1.0 - mat.metallic) * mat.albedo;
-        throughputMult = kd / denomDiff;
-        return Ray(origin, L);
+    if(rand() < specProb) {
+        vec3 dir=normalize(mix(
+            reflect(-V,N),
+            randomUnitHemisphere(N),
+            mat.roughness*mat.roughness
+        ));
+
+        throughputMult=
+            mix(vec3(1.0),mat.albedo,mat.metallic)*
+            fresnel/specProb;
+
+        return Ray(origin,dir);
     }
+
+    vec3 dir=randomUnitHemisphere(N);
+    vec3 kd=mat.albedo*(1.0-mat.metallic)*(vec3(1.0)-fresnel);
+
+    throughputMult=kd/(1.0-specProb);
+
+    return Ray(origin,dir);
 }
 
 void handleHit(inout vec3 col, Ray ray, HitResult hit) {
-    const int MAX_BOUNCES = 6;
+    const int MAX_BOUNCES = 10;
+    const float epsilon = 0.0001;
 
     Ray currentRay = ray;
     vec3 throughput = vec3(1.0);
@@ -237,38 +253,49 @@ void handleHit(inout vec3 col, Ray ray, HitResult hit) {
 
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         // Find next surface intersection for this ray
-        HitResult nextHit = raySceneIntersection(currentRay);
+        HitResult nextHit = raySceneIntersection(currentRay, true);
         float distToSurface = nextHit.hit ? nextHit.t : 1e30;
 
-        // Medium sampling (homogeneous medium)
-        float sigma_s = max(0.0, u_sigma_s);
-        float sigma_a = max(0.0, u_sigma_a);
-        float sigma_t = sigma_s + sigma_a;
+        if (nextHit.material.alpha < 1.0 - epsilon && !bool(nextHit.material.dielectric)) {
 
-        bool didScatterInMedium = false;
-        if (sigma_t > 1e-8) {
-            float freeDist = -log(max(1e-6, 1.0 - rand())) / sigma_t;
-            if (freeDist < distToSurface) {
-                // Scattering event before hitting a surface
-                vec3 scatterPos = currentRay.origin + currentRay.direction * freeDist;
-                // albedo of the medium
-                float mediumAlbedo = sigma_s / sigma_t;
-                throughput *= mediumAlbedo;
+            // Fog density: alpha = 0 -> no medium, alpha = 1 -> dense medium
+            float sigma_t = nextHit.material.alpha * 2.0; // tweak 2.0
 
-                // sample new direction from phase function
-                vec3 newDir = samplePhaseHG(currentRay.direction, u_phase_g);
-                currentRay.origin = scatterPos + newDir * 1e-4;
-                currentRay.direction = normalize(newDir);
-                didScatterInMedium = true;
-                // continue tracing from scattering point (counts as a bounce)
+            vec3 mediumEntry = currentRay.origin + currentRay.direction * distToSurface;
+
+            HitResult exitHit = raySceneIntersection(
+                Ray(mediumEntry + epsilon * currentRay.direction, currentRay.direction),
+                false
+            );
+
+            float distanceInMedium = length(exitHit.position - mediumEntry);
+
+            // Sample free-flight distance
+            float hitT = -log(max(rand(), 1e-6)) / sigma_t;
+
+            if (hitT < distanceInMedium) {
+                // Isotropic scattering event
+                accum += throughput * nextHit.material.emissive; 
+                vec3 scatterPoint = mediumEntry + currentRay.direction * hitT;
+                throughput *= exp(-sigma_t * hitT) * nextHit.material.albedo;
+
+                vec3 newDir = normalize(vec3(
+                    2.0 * rand() - 1.0,
+                    2.0 * rand() - 1.0,
+                    2.0 * rand() - 1.0
+                ));
+
+                currentRay = Ray(scatterPoint + epsilon * newDir, newDir);
                 continue;
-            } else {
-                // No scattering before surface: attenuate by transmittance
-                throughput *= exp(-sigma_t * distToSurface);
             }
+
+            // No scattering: ray exits medium
+            throughput *= exp(-sigma_t * distanceInMedium);
+
+            currentRay = Ray(exitHit.position + epsilon * currentRay.direction, currentRay.direction);
+            continue;
         }
 
-        // If we reach here, either we hit a surface, or there's no medium.
         if (!nextHit.hit) {
             accum += throughput * iBackground;
             break;
@@ -280,7 +307,7 @@ void handleHit(inout vec3 col, Ray ray, HitResult hit) {
         // Surface scattering
         vec3 V = -currentRay.direction;
         vec3 throughputMult;
-        Ray scattered = pbrBounce(V, nextHit.normal, nextHit.position, nextHit.material, throughputMult);
+        Ray scattered = pbrBounce(V, nextHit.normal, nextHit, nextHit.material, throughputMult);
         throughput *= throughputMult;
 
         // Russian roulette
@@ -289,7 +316,7 @@ void handleHit(inout vec3 col, Ray ray, HitResult hit) {
             break;
         throughput /= max(1e-6, survivalProb);
 
-        // advance ray to scattered ray and loop
+        // Advance ray to scattered ray and loop
         currentRay = scattered;
     }
     col = accum;
@@ -317,8 +344,7 @@ void main() {
     float z = 1.0 / tan(fov * 0.5);
 
     // Length where the ray hits the focal plane, controls depth of field strength.
-    // This does NOT control the field of view — FOV is handled by 'z'.
-    // focalLength is the distance from the camera where rays should converge to create a sharp image.
+    // This does NOT control the field of view - FOV is handled by 'z'.
     float focalLength = distance(camPos, camTarget);
 
     vec2 pixelSize = vec2(2.0 / iResolution.y);
@@ -338,7 +364,7 @@ void main() {
         rayDir = normalize(focalPoint - camPosJittered);
         Ray ray = Ray(camPosJittered, rayDir);
 
-        HitResult result = raySceneIntersection(ray);
+        HitResult result = raySceneIntersection(ray, true);
 
         vec3 col;
         if (result.hit) {

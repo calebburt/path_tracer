@@ -10,7 +10,7 @@ from PIL import Image
 
 # GPU layout must match the GLSL std430 packing of:
 #   struct Material {
-#       vec3 emissive; vec3 albedo; uint reflects;
+#       vec3 emissive; float ior; vec3 albedo; uint dielectric;
 #       float roughness; float metallic;
 #   };
 #   struct Triangle { vec3 v0; vec3 v1; vec3 v2; Material material; };
@@ -26,10 +26,10 @@ triangle_dtype = np.dtype([
     ("_pad2",    np.float32),
 
     ("emissive", np.float32, 3),
-    ("_pad3",    np.float32),
+    ("ior",    np.float32),
 
     ("albedo",   np.float32, 3),
-    ("reflects", np.uint32),
+    ("dielectric", np.uint32),
 
     ("alpha",     np.float32),
     ("roughness", np.float32),
@@ -41,6 +41,7 @@ assert triangle_dtype.itemsize == 96
 
 MaterialTuple = tuple[
     tuple[float, float, float],  # emissive  (Ke)
+    float,                       # ior       (Ni)
     tuple[float, float, float],  # albedo    (Kd)
     float,                       # alpha     (d)
     float,                       # roughness (Pr)
@@ -60,10 +61,11 @@ def _parse_mtl(path: Path) -> dict[str, MaterialTuple]:
     d = 1.0
     pr = 1.0   # default fully rough
     pm = 0.0   # default dielectric
+    illum = 1
 
     def flush() -> None:
         if name is not None:
-            materials[name] = (ke, kd, d, pr, pm)
+            materials[name] = (ke, kd, d, pr, pm, ni, illum)
 
     with open(path) as f:
         for raw in f:
@@ -77,6 +79,7 @@ def _parse_mtl(path: Path) -> dict[str, MaterialTuple]:
                 kd = (1.0, 1.0, 1.0)
                 ke = (0.0, 0.0, 0.0)
                 pr = 1.0
+                ni = 1.0
                 pm = 0.0
             elif tag == "Kd" and len(parts) >= 4:
                 kd = (float(parts[1]), float(parts[2]), float(parts[3]))
@@ -88,6 +91,10 @@ def _parse_mtl(path: Path) -> dict[str, MaterialTuple]:
                 pr = float(parts[1])
             elif tag == "Pm" and len(parts) >= 2:
                 pm = float(parts[1])
+            elif tag == "Ni" and len(parts) >= 2:
+                ni = float(parts[1])
+            elif tag == "illum" and len(parts) >= 2:
+                illum = int(parts[1])
     flush()
     return materials
 
@@ -129,15 +136,16 @@ def load_triangles_from_obj(path: str) -> np.ndarray:
 
     default_mat: MaterialTuple = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 1.0, 1.0, 0.0)
     for i, (a, b, c, mat_name) in enumerate(faces):
-        emissive, albedo, alpha, roughness, metallic = (
+        emissive, albedo, alpha, roughness, metallic, ior, illum = (
             materials.get(mat_name, default_mat) if mat_name else default_mat
         )
         out[i]["v0"] = verts[a]
         out[i]["v1"] = verts[b]
         out[i]["v2"] = verts[c]
         out[i]["emissive"] = emissive
+        out[i]["ior"] = ior
         out[i]["albedo"] = albedo
-        out[i]["reflects"] = 1 if any(ch != 0.0 for ch in albedo) else 0
+        out[i]["dielectric"] = 1 if illum == 7 else 0
         out[i]["alpha"] = alpha
         out[i]["roughness"] = roughness
         out[i]["metallic"] = metallic
