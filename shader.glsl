@@ -203,7 +203,7 @@ Ray pbrBounce(vec3 V, vec3 N, HitResult hit, Material mat, out vec3 throughputMu
             if (mat.roughness>0.0)
                 dir=normalize(dir+randomUnitSphere()*mat.roughness);
 
-            throughputMult=mat.albedo;
+            throughputMult=vec3(-1.0);
         }
 
         return Ray(hit.position+dir*EPS,dir);
@@ -293,6 +293,34 @@ void handleHit(inout vec3 col, Ray ray, HitResult hit) {
             throughput *= exp(-sigma_t * distanceInMedium);
 
             currentRay = Ray(exitHit.position + epsilon * currentRay.direction, currentRay.direction);
+            continue;
+        } else if (nextHit.material.alpha < 1.0) {
+            vec3 throughputMult;
+            Ray scattered = pbrBounce(-currentRay.direction, nextHit.normal, nextHit, nextHit.material, throughputMult);
+            if (throughputMult.r < 0.0) {
+                vec3 mediumEntry = currentRay.origin + currentRay.direction * distToSurface;
+
+                HitResult exitHit = raySceneIntersection(
+                    Ray(mediumEntry + epsilon * currentRay.direction, currentRay.direction),
+                    false
+                );
+
+                float distanceInMedium = length(exitHit.position - mediumEntry);
+
+                // Convert albedo to absorption coefficient
+                vec3 sigma_a = -log(max(nextHit.material.albedo, vec3(1e-6)));
+
+                // Scale by alpha
+                vec3 sigma_a_final = nextHit.material.alpha * sigma_a;
+
+                // Exponential attenuation
+                vec3 extinction = exp(-sigma_a_final * distanceInMedium);
+                accum += throughput * nextHit.material.emissive;
+                throughput *= extinction;
+            } else {
+                accum += throughput * nextHit.material.emissive;
+            }
+            currentRay = scattered;
             continue;
         }
 
